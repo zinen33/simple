@@ -1,48 +1,40 @@
 const express = require("express");
-const Botly = require("botly");
-const https = require("https");
-const axios = require("axios");
-
 const app = express();
+const bodyParser = require("body-parser");
+const Botly = require("botly");
+const axios = require("axios");
+const { createClient } = require("@supabase/supabase-js");
 
+// إعداد Supabase
+const supabase = createClient(process.env.SB_URL, process.env.SB_KEY, { auth: { persistSession: false } });
+
+// إعداد Botly
 const botly = new Botly({
   accessToken: process.env.PAGE_ACCESS_TOKEN,
-  verifyToken: process.env.VERIFY_TOKEN,
-  webHookPath: process.env.WB_PATH,
   notificationType: Botly.CONST.REGULAR,
-  FB_URL: "https://graph.facebook.com/v13.0/"
+  FB_URL: "https://graph.facebook.com/v2.6/",
 });
 
-function keepAppRunning() {
-  setInterval(() => {
-    https.get(`${process.env.RENDER_EXTERNAL_URL}/ping`, (resp) => {
-      if (resp.statusCode === 200) {
-        console.log("Ping successful");
-      } else {
-        console.error("Ping failed");
-      }
-    });
-  }, 5 * 60 * 1000);
-}
+// إعداد الخادم
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
 
-app.get("/", (_req, res) => res.sendStatus(200));
-app.get("/ping", (_req, res) => res.status(200).json({ message: "Ping successful" }));
+app.get("/", (_req, res) => {
+  res.sendStatus(200);
+});
 
-app.use(express.json({ verify: botly.getVerifySignature(process.env.APP_SECRET) }));
-app.use(express.urlencoded({ extended: false }));
-
-app.use("/webhook", botly.router());
-
-async function chatWithGPT(messages) {
-  const tokenList = require("./apikey.json")[0].token;
-  const apiKey = tokenList[Math.floor(Math.random() * tokenList.length)];
+// دالة الاتصال بـ GPT من خلال RapidAPI
+async function chat(messages) {
+  const apikey = require("./apikey.json");
+  const token = apikey[Math.floor(Math.random() * apikey.length)];
+  const key = token.token[Math.floor(Math.random() * token.token.length)];
 
   const options = {
     method: "POST",
     url: "https://chatgpt-vision1.p.rapidapi.com/",
     headers: {
-      "Content-Type": "application/json",
-      "X-RapidAPI-Key": apiKey,
+      "content-type": "application/json",
+      "X-RapidAPI-Key": key,
       "X-RapidAPI-Host": "chatgpt-vision1.p.rapidapi.com",
     },
     data: { messages },
@@ -52,33 +44,121 @@ async function chatWithGPT(messages) {
     const response = await axios.request(options);
     return response.data.choices[0].message.content;
   } catch (error) {
-    console.error("Error in chatWithGPT:", error);
-    return "عذرًا، حدث خطأ أثناء المعالجة.";
+    console.error("Error fetching GPT response:", error.message);
+    throw new Error("GPT API request failed");
   }
 }
 
-botly.on("message", async (senderId, message, data) => {
-  let userMessage = "";
+// دوال قاعدة البيانات
+async function createUser(user) {
+  const { data, error } = await supabase.from("users").insert([user]);
 
-  if (message.message.text) {
-    userMessage = message.message.text;
-  } else if (message.message.attachments?.[0]?.type) {
-    userMessage = `تلقيت ملف من النوع: ${message.message.attachments[0].type}`;
-  } else {
-    userMessage = "رسالة غير معروفة.";
+  if (error) {
+    throw new Error("Error creating user:", error);
   }
+  return data;
+}
 
-  const gptMessages = [
-    { role: "system", content: "أنت مساعد ذكي يساعد المستخدمين باللغة العربية." },
-    { role: "user", content: userMessage },
-  ];
+async function updateUser(id, update) {
+  const { data, error } = await supabase.from("users").update(update).eq("uid", id);
 
-  const gptResponse = await chatWithGPT(gptMessages);
+  if (error) {
+    throw new Error("Error updating user:", error);
+  }
+  return data;
+}
 
-  botly.sendText({ id: senderId, text: gptResponse });
+async function userDb(userId) {
+  const { data, error } = await supabase.from("users").select("*").eq("uid", userId);
+
+  if (error) {
+    console.error("Error checking user:", error);
+  }
+  return data;
+}
+
+// دالة تقسيم النصوص إلى أجزاء صغيرة
+function splitTextIntoChunks(text, chunkSize) {
+  const words = text.split(" ");
+  const chunks = [];
+  let currentChunk = "";
+
+  for (const word of words) {
+    if (currentChunk.length + word.length + 1 <= chunkSize) {
+      if (currentChunk) currentChunk += " ";
+      currentChunk += word;
+    } else {
+      chunks.push(currentChunk);
+      currentChunk = word;
+    }
+  }
+  if (currentChunk) chunks.push(currentChunk);
+  return chunks;
+}
+
+// معالجة الرسائل
+const onMessage = async (senderId, message) => {
+  if (message.message.text) {
+    const userMessage = message.message.text;
+    botly.sendAction({ id: senderId, action: Botly.CONST.ACTION_TYPES.TYPING_ON });
+
+    try {
+      const userHistory = await userDb(senderId);
+      let messages = [
+        { role: "system", content: "مرحبًا! أنا هنا للمساعدة. كيف يمكنني مساعدتك؟" },
+        { role: "user", content: userMessage },
+      ];
+
+      if (userHistory[0]) {
+        messages = [...userHistory[0].data, { role: "user", content: userMessage }];
+      }
+
+      const gptResponse = await chat(messages);
+
+      const updatedHistory = [...messages, { role: "assistant", content: gptResponse }];
+      await updateUser(senderId, { time: Date.now() + 3600000, data: updatedHistory });
+
+      if (gptResponse.length > 2000) {
+        const textChunks = splitTextIntoChunks(gptResponse, 1600);
+        for (const chunk of textChunks) {
+          botly.sendText({
+            id: senderId,
+            text: chunk,
+            quick_replies: [botly.createQuickReply("👍", "up"), botly.createQuickReply("👎", "down")],
+          });
+        }
+      } else {
+        botly.sendText({
+          id: senderId,
+          text: gptResponse,
+          quick_replies: [botly.createQuickReply("👍", "up"), botly.createQuickReply("👎", "down")],
+        });
+      }
+    } catch (error) {
+      botly.sendText({ id: senderId, text: "حدث خطأ أثناء معالجة طلبك. حاول مرة أخرى لاحقًا." });
+      console.error(error);
+    } finally {
+      botly.sendAction({ id: senderId, action: Botly.CONST.ACTION_TYPES.TYPING_OFF });
+    }
+  }
+};
+
+// معالجة الردود السريعة أو الأحداث الأخرى
+const onPostBack = async (senderId, message, postback) => {
+  if (postback === "up" || postback === "down") {
+    botly.sendText({ id: senderId, text: "شكرا لترك التقييم ♥" });
+  }
+};
+
+// نقطة نهاية الـ Webhook
+app.post("/webhook", (req, res) => {
+  if (req.body.message) {
+    onMessage(req.body.message.sender.id, req.body.message);
+  } else if (req.body.postback) {
+    onPostBack(req.body.postback.message.sender.id, req.body.postback.message, req.body.postback.postback);
+  }
+  res.sendStatus(200);
 });
 
-app.listen(process.env.PORT, () => {
-  console.log(`App is running on port ${process.env.PORT}`);
-  keepAppRunning();
-});
+// تشغيل الخادم
+app.listen(3000, () => console.log("App is running on port 3000"));
