@@ -1,63 +1,60 @@
 const express = require("express");
 const app = express();
+const bodyParser = require("body-parser");
 const Botly = require("botly");
-const https = require("https");
+const { gpt } = require("gpti"); // استيراد مكتبة gpti
+
 const botly = new Botly({
     accessToken: process.env.PAGE_ACCESS_TOKEN,
-    verifyToken: process.env.VERIFY_TOKEN,
-    webHookPath: process.env.WB_PATH,
     notificationType: Botly.CONST.REGULAR,
-    FB_URL: "https://graph.facebook.com/v13.0/"
+    FB_URL: "https://graph.facebook.com/v2.6/",
 });
 
-function keepAppRunning() {
-    setInterval(() => {
-      https.get(`${process.env.RENDER_EXTERNAL_URL}/ping`, (resp) => {
-        if (resp.statusCode === 200) {
-          console.log('Ping successful');
-        } else {
-          console.error('Ping failed');
-        }
-      });
-    }, 5 * 60 * 1000);
-};
+app.get("/", function (_req, res) {
+    res.sendStatus(200);
+});
 
-app.get("/", function (_req, res) { res.sendStatus(200); });
+/* ----- ESSENTIALS ----- */
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
 
-app.get('/ping', (req, res) => { res.status(200).json({ message: 'Ping successful' }); });
+/* ----- WEBHOOK HANDLER ----- */
+app.post('/webhook', async (req, res) => {
+    const event = req.body;
 
-app.use(express.json({ verify: botly.getVerifySignature(process.env.APP_SECRET)}));
-app.use(express.urlencoded({ extended: false }));
+    // التعامل مع نوع الحدث
+    if (event.type === "message") {
+        let prompt = event.message.text;
 
-app.use("/webhook", botly.router());
+        // استخدام مكتبة gpti
+        let data = await gpt.v1({
+            messages: [], // يمكن تعديل المحادثات السابقة هنا إذا لزم الأمر
+            prompt: prompt,
+            model: "GPT-4",
+            markdown: false
+        });
 
-botly.on("message", async (senderId, message, data) => {
-    if (message.message.text) {
-        
-        botly.sendText({ id: senderId, text: "نص" });
+        botly.sendText({ id: event.sender.id, text: data.gpt }).catch(err => {
+            console.error("Error sending message:", err);
+        });
 
-    } else if (message.message.attachments[0].payload.sticker_id) {
-        
-       botly.sendText({ id: senderId, text: "ستيكر/ زر الاعجاب" });
+    } else if (event.type === "message_reply") {
+        let prompt = `Message: "${event.message.text}"\n\nReplying to: ${event.message.reply_to.text}`;
 
-    } else if (message.message.attachments[0].type == "image") {
+        let data = await gpt.v1({
+            messages: [], // يمكن تعديل المحادثات السابقة هنا أيضًا
+            prompt: prompt,
+            model: "GPT-4",
+            markdown: false
+        });
 
-        botly.sendText({ id: senderId, text: "صورة" });
-
-    } else if (message.message.attachments[0].type == "audio") {
-
-        botly.sendText({ id: senderId, text: "فوكال" });
-
-    } else if (message.message.attachments[0].type == "video") {
-
-        botly.sendText({ id: senderId, text: "فيديو" });
-
+        botly.sendText({ id: event.sender.id, text: data.gpt }).catch(err => {
+            console.error("Error sending reply:", err);
+        });
     }
+
+    res.sendStatus(200);
 });
 
-botly.on("postback", async (senderId, message, postback, data, ref) => { /* Postback Payloads */});
-
-app.listen(process.env.PORT, () => {
-    console.log(`App is on port : ${process.env.PORT}`);
-    keepAppRunning();
-  });
+/* ----- START SERVER ----- */
+app.listen(3000, () => console.log(`App is running on port 3000`));
