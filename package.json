@@ -8,6 +8,7 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "gpti": "^2.1.8",
   "description": "",
   "dependencies": {
     "botly": "^1.6.2",
